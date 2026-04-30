@@ -1,4 +1,5 @@
 {
   "name": "agent-conductor",
-  "description": "Multi-agent flow visibility: automatic tree report at session end and live terminal monitor showing context window usage per agent"
+  "description": "Multi-agent flow visibility: automatic tree report at session end and live terminal monitor showing context window usage per agent",
+  "hooks": "./hooks/hooks.json"
 }
