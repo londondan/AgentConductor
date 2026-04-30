@@ -1,0 +1,11 @@
+# Claude Code local settings (project-specific permissions, not for sharing)
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+
+# Runtime state files (generated at session time)
+state/
+*.pid
+*.tmp
