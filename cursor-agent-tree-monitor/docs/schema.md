@@ -28,7 +28,7 @@ The core schema is environment-agnostic. Cursor-specific transcript paths, SDK r
 - `evidence`: Short source references used to audit inferred fields.
 - `metadata`: Adapter-specific node fields.
 
-Cursor transcript nodes may include `metadata.tools`, an array of paired tool-use/tool-result records extracted from subagent JSONL files. Transcript-derived model names are recorded-only: the adapter displays explicit fields such as `model`, `modelName`, `model_name`, or a subagent tool input `model`, and otherwise leaves the model unknown.
+Cursor transcript nodes may include `metadata.tools`, an array of paired tool-use/tool-result records extracted from subagent JSONL files. Transcript-derived model names are recorded-only: the adapter displays explicit fields such as `model`, `modelName`, `model_name`, a subagent tool input `model`, or Cursor hook telemetry for the same conversation/tool-use ID. Otherwise, the model remains unknown.
 
 ## AgentEdge
 
@@ -44,4 +44,4 @@ Edges are derived from normalized node parentage so every renderer can consume t
 - `warning`: At least `75%` and less than `90%`.
 - `high`: At least `90%`.
 
-Risk calculations preserve metric confidence. Transcript-derived context is normally `estimated`; SDK-instrumented context can be `recorded` when the wrapper captures enough telemetry. Cursor extension users can provide `agentTreeMonitor.modelContextLimits` keyed by exact recorded model name to override transcript context limits for known models.
+Risk calculations preserve metric confidence. Transcript-derived context is normally `estimated`; SDK-instrumented context can be `recorded` when the wrapper captures enough telemetry. Cursor extension users can provide `agentTreeMonitor.modelContextLimits` keyed by exact recorded model name to override transcript context limits for known models. Hook telemetry defaults to `~/.cursor/agent-tree-monitor/model-events.jsonl` and can be overridden with `agentTreeMonitor.modelTelemetryPath`.

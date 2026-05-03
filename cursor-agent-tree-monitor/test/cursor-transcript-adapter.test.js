@@ -141,6 +141,61 @@ test("uses explicitly recorded model metadata for node labels and context limits
   assert.equal(child.context.limitTokens, 200_000);
 });
 
+test("uses hook telemetry model data for root and subagent nodes", async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), "agent-tree-monitor-"));
+  const telemetryPath = join(rootDir, "model-events.jsonl");
+  const sessionId = "hook-root";
+  const childId = "hook-child";
+  const toolUseId = "toolu_child_model";
+  const sessionDir = join(rootDir, sessionId);
+  await mkdir(join(sessionDir, "subagents"), { recursive: true });
+
+  await writeFile(
+    telemetryPath,
+    [
+      JSON.stringify({ event: "sessionStart", conversationId: sessionId, sessionId, model: "gpt-5.5-medium" }),
+      JSON.stringify({ event: "subagentStop", parentConversationId: sessionId, subagentId: toolUseId, model: "claude-sonnet-4.6" }),
+    ].join("\n"),
+  );
+  await writeFile(
+    join(sessionDir, `${sessionId}.jsonl`),
+    [
+      jsonlUser("Monitor hook models"),
+      JSON.stringify({
+        role: "assistant",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              id: toolUseId,
+              name: "Subagent",
+              input: { resume: childId, description: "Check hook child model", subagent_type: "generalPurpose" },
+            },
+          ],
+        },
+      }),
+    ].join("\n"),
+  );
+  await writeFile(join(sessionDir, "subagents", `${childId}.jsonl`), jsonlUser("Child work without model in transcript"));
+
+  const adapter = new CursorTranscriptAdapter({
+    transcriptRoot: rootDir,
+    modelTelemetryPath: telemetryPath,
+    modelContextLimits: {
+      "gpt-5.5-medium": 400_000,
+      "claude-sonnet-4.6": 200_000,
+    },
+  });
+  const graph = await adapter.loadSessionGraph(sessionId);
+  const child = graph.nodes.find((node) => node.id === childId);
+
+  assert.deepEqual(graph.nodes[0].model, { name: "gpt-5.5-medium", confidence: "recorded" });
+  assert.equal(graph.nodes[0].context.limitTokens, 400_000);
+  assert.deepEqual(child.model, { name: "claude-sonnet-4.6", confidence: "recorded" });
+  assert.equal(child.context.limitTokens, 200_000);
+  assert.equal(child.metadata.modelSource, "cursor_hook_telemetry");
+});
+
 test("filters stale unlinked child transcripts when parent has explicit subagent calls", async () => {
   const rootDir = await mkdtemp(join(tmpdir(), "agent-tree-monitor-"));
   const sessionId = "root-session";

@@ -66,6 +66,11 @@
           "type": "object",
           "default": {},
           "description": "Optional model-specific context token limits keyed by exact recorded model name, for example {\"composer-2-fast\": 200000}."
+        },
+        "agentTreeMonitor.modelTelemetryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override for Cursor hook model telemetry JSONL. Defaults to ~/.cursor/agent-tree-monitor/model-events.jsonl."
         }
       }
     }

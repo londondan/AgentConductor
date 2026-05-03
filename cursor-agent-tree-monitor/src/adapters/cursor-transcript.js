@@ -5,13 +5,15 @@ import { AgentSourceAdapter } from "./interface.js";
 import { inferAgentStatus } from "../state.js";
 import { extractToolAttribution } from "../tool-attribution.js";
 import { TranscriptCache } from "../transcript-cache.js";
+import { readCursorHookTelemetry } from "../cursor-hook-telemetry.js";
 
 export class CursorTranscriptAdapter extends AgentSourceAdapter {
-  constructor({ transcriptRoot, defaultContextLimitTokens = 1_000_000, modelContextLimits = {}, now = () => new Date(), activityWindowMs = 5 * 60 * 1000, staleWindowMs = 15 * 60 * 1000, cache = new TranscriptCache() }) {
+  constructor({ transcriptRoot, defaultContextLimitTokens = 1_000_000, modelContextLimits = {}, modelTelemetryPath = null, now = () => new Date(), activityWindowMs = 5 * 60 * 1000, staleWindowMs = 15 * 60 * 1000, cache = new TranscriptCache() }) {
     super();
     this.transcriptRoot = transcriptRoot;
     this.defaultContextLimitTokens = defaultContextLimitTokens;
     this.modelContextLimits = modelContextLimits;
+    this.modelTelemetryPath = modelTelemetryPath;
     this.now = now;
     this.activityWindowMs = activityWindowMs;
     this.staleWindowMs = staleWindowMs;
@@ -49,6 +51,8 @@ export class CursorTranscriptAdapter extends AgentSourceAdapter {
     const rootPath = join(sessionDir, `${sessionId}.jsonl`);
     const rootStats = await stat(rootPath);
     const rootLines = await this.cache.readJsonl(rootPath);
+    const modelTelemetry = await readCursorHookTelemetry(this.modelTelemetryPath);
+    const rootModel = modelTelemetry.modelForConversation(sessionId) ?? extractRecordedModel(rootLines);
 
     const rootSummary = extractUserQuery(rootLines) ?? "Root orchestrator";
     const nodes = [
@@ -61,14 +65,16 @@ export class CursorTranscriptAdapter extends AgentSourceAdapter {
         modifiedAt: rootStats.mtime,
         lines: rootLines,
         lineCount: rootLines.length,
-        contextLimit: contextLimitForModel(extractRecordedModel(rootLines), this.modelContextLimits, this.defaultContextLimitTokens),
+        contextLimit: contextLimitForModel(rootModel, this.modelContextLimits, this.defaultContextLimitTokens),
         now: this.now(),
         activityWindowMs: this.activityWindowMs,
         staleWindowMs: this.staleWindowMs,
+        model: rootModel,
+        modelSource: rootModel === modelTelemetry.modelForConversation(sessionId) ? "cursor_hook_telemetry" : "cursor_transcript",
       }),
     ];
     const seen = new Set([sessionId]);
-    nodes.push(...(await this.collectSubagentNodes({ ownerSessionId: sessionId, parentId: sessionId, seen })));
+    nodes.push(...(await this.collectSubagentNodes({ ownerSessionId: sessionId, parentId: sessionId, rootSessionId: sessionId, seen, modelTelemetry })));
 
     return {
       session: {
@@ -82,7 +88,7 @@ export class CursorTranscriptAdapter extends AgentSourceAdapter {
     };
   }
 
-  async collectSubagentNodes({ ownerSessionId, parentId, seen }) {
+  async collectSubagentNodes({ ownerSessionId, parentId, rootSessionId, seen, modelTelemetry }) {
     const ownerDir = join(this.transcriptRoot, ownerSessionId);
     const ownerMainPath = join(ownerDir, `${ownerSessionId}.jsonl`);
     const ownerLines = (await exists(ownerMainPath)) ? await this.cache.readJsonl(ownerMainPath) : [];
@@ -97,6 +103,8 @@ export class CursorTranscriptAdapter extends AgentSourceAdapter {
       seen.add(childId);
 
       const task = taskLinks.get(childId);
+      const telemetryModel = task?.toolUseId ? modelTelemetry.modelForSubagentToolUse(rootSessionId, task.toolUseId) : null;
+      const model = telemetryModel ?? extractRecordedModel(child.lines, task);
 
       nodes.push(
         transcriptNode({
@@ -108,26 +116,28 @@ export class CursorTranscriptAdapter extends AgentSourceAdapter {
           modifiedAt: child.stats.mtime,
           lines: child.lines,
           lineCount: child.lines.length,
-          contextLimit: contextLimitForModel(extractRecordedModel(child.lines, task), this.modelContextLimits, this.defaultContextLimitTokens),
+          contextLimit: contextLimitForModel(model, this.modelContextLimits, this.defaultContextLimitTokens),
           now: this.now(),
           activityWindowMs: this.activityWindowMs,
           staleWindowMs: this.staleWindowMs,
           task,
+          model,
+          modelSource: telemetryModel ? "cursor_hook_telemetry" : "cursor_transcript",
         }),
       );
 
-      nodes.push(...(await this.collectSubagentNodes({ ownerSessionId: childId, parentId: childId, seen })));
+      nodes.push(...(await this.collectSubagentNodes({ ownerSessionId: childId, parentId: childId, rootSessionId, seen, modelTelemetry })));
     }
 
     return nodes;
   }
 }
 
-function transcriptNode({ id, parentId, type, summary, transcriptPath, modifiedAt, lines, lineCount, contextLimit, now, activityWindowMs, staleWindowMs, task }) {
+function transcriptNode({ id, parentId, type, summary, transcriptPath, modifiedAt, lines, lineCount, contextLimit, now, activityWindowMs, staleWindowMs, task, model = null, modelSource = "cursor_transcript" }) {
   const estimatedTokens = Math.max(1, lineCount) * 1_000;
   const state = inferAgentStatus({ now, modifiedAt, lines, activityWindowMs, staleWindowMs });
   const tools = extractToolAttribution(lines);
-  const model = extractRecordedModel(lines, task);
+  const recordedModel = model ?? extractRecordedModel(lines, task);
 
   return {
     id,
@@ -135,7 +145,7 @@ function transcriptNode({ id, parentId, type, summary, transcriptPath, modifiedA
     type,
     summary,
     status: state.status,
-    model: model ? { name: model, confidence: "recorded" } : { name: null, confidence: "unknown" },
+    model: recordedModel ? { name: recordedModel, confidence: "recorded" } : { name: null, confidence: "unknown" },
     context: {
       usedTokens: estimatedTokens,
       limitTokens: contextLimit,
@@ -147,7 +157,7 @@ function transcriptNode({ id, parentId, type, summary, transcriptPath, modifiedA
       { kind: "file", value: transcriptPath },
       ...(task ? [{ kind: "task", value: task.prompt }] : []),
     ],
-    metadata: { transcriptPath, lineCount, modifiedAt: modifiedAt.toISOString(), statusHeuristic: state.reason, tools: tools.tools },
+    metadata: { transcriptPath, lineCount, modifiedAt: modifiedAt.toISOString(), statusHeuristic: state.reason, tools: tools.tools, modelSource: recordedModel ? modelSource : "unknown" },
   };
 }
 
@@ -178,6 +188,7 @@ function extractTaskLinks(lines, childEntries = []) {
         summary: input.description ?? firstSentence(input.prompt) ?? childId,
         prompt: input.prompt ?? "",
         model: typeof input.model === "string" && input.model.trim() ? input.model.trim() : null,
+        toolUseId: part.id ?? null,
       };
 
       if (childId) links.set(childId, task);

@@ -11,4 +11,5 @@ test("contributes a persistent activity bar webview view", () => {
   assert.equal(manifest.contributes.views.agentTreeMonitor[0].id, "agentTreeMonitor.view");
   assert.equal(manifest.contributes.views.agentTreeMonitor[0].type, "webview");
   assert.equal(manifest.contributes.configuration.properties["agentTreeMonitor.modelContextLimits"].type, "object");
+  assert.equal(manifest.contributes.configuration.properties["agentTreeMonitor.modelTelemetryPath"].type, "string");
 });

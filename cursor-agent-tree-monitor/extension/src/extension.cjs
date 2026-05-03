@@ -67,12 +67,13 @@ async function createPanelController({ context, vscode, panel }) {
   const explicitRoot = config.get("transcriptRoot") || process.env.AGENT_TREE_TRANSCRIPT_ROOT || "";
   const refreshSeconds = Number(config.get("refreshSeconds") || 2);
   const modelContextLimits = config.get("modelContextLimits") || {};
+  const modelTelemetryPath = config.get("modelTelemetryPath") || process.env.AGENT_TREE_MODEL_EVENTS || path.join(os.homedir(), ".cursor", "agent-tree-monitor", "model-events.jsonl");
   const transcriptRoot = resolveTranscriptRoot({
     explicitRoot,
     homeDir: os.homedir(),
     workspacePath,
   });
-  const adapter = new modules.CursorTranscriptAdapter({ transcriptRoot, modelContextLimits });
+  const adapter = new modules.CursorTranscriptAdapter({ transcriptRoot, modelContextLimits, modelTelemetryPath });
   let selectedSessionId = "latest";
   let interval = null;
   let disposed = false;

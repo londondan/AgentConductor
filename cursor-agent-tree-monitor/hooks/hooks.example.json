@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "node /Users/danjames/AgentConductor/cursor-agent-tree-monitor/hooks/record-model.cjs",
+        "timeout": 10
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "node /Users/danjames/AgentConductor/cursor-agent-tree-monitor/hooks/record-model.cjs",
+        "timeout": 10
+      }
+    ]
+  }
+}
