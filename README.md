@@ -67,23 +67,6 @@ python3 /Users/danjames/AgentConductor/scripts/monitor.py --session-id <id>
 - `scripts/tree.py` — transcript walker + ledger merger, builds the tree with mtime caching
 - `scripts/monitor.py` — curses TUI
 - `commands/monitor.md` — `/monitor` slash command (prints launch instructions)
-- `cursor-agent-tree-monitor/` — temporary Cursor-side agent tree monitor and extension wrapper for Cursor JSONL transcripts
-
-## Cursor Agent Tree Monitor
-
-The Cursor monitor lives in `cursor-agent-tree-monitor/` while we decide how to collapse the Cursor and Agent Conductor surfaces together. It includes:
-
-- a portable agent graph core and ASCII renderer
-- a Cursor transcript adapter with recursive subagent discovery
-- a Cursor/VS Code webview extension wrapper
-- tests for live transcript parsing, context-risk rendering, session picking, and colored webview rows
-
-Run its test suite directly from the subproject:
-
-```bash
-cd cursor-agent-tree-monitor
-node --test test/*.test.js extension/test/*.test.cjs
-```
 
 ## Storage
 
