@@ -9,6 +9,7 @@ Caches per (path, mtime, size) so repeated refreshes only re-parse changed files
 import json
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -180,10 +181,129 @@ def _find_subagent_transcripts(root_transcript_path: Path) -> dict[str, Path]:
     return result
 
 
+def _parse_iso(ts: str) -> float:
+    """Parse ISO8601 with optional fractional seconds (truncated to micro)."""
+    if not ts:
+        return 0.0
+    s = ts
+    if "." in s:
+        head, tail = s.split(".", 1)
+        tz_idx = -1
+        for i, ch in enumerate(tail):
+            if ch in ("Z", "+", "-"):
+                tz_idx = i
+                break
+        frac = tail[:tz_idx] if tz_idx >= 0 else tail
+        tz = tail[tz_idx:] if tz_idx >= 0 else ""
+        s = f"{head}.{frac[:6]}{tz}"
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _load_spawn_ledger(session_id: str) -> list[dict]:
+    """Read the PreToolUse hook ledger for this session, sorted by spawned_at.
+
+    Each line is one Agent/Task spawn event with fields {caller_id,
+    caller_transcript, tool_name, subagent_type, description, prompt_preview,
+    spawned_at}. The ledger gives us authoritative parent→child edges that
+    aren't recoverable from subagent transcripts alone (Claude Code does not
+    embed tool_use_id or matching toolUseResult.agentId rows for spawns made
+    from inside a subagent, so transcript-only parsing yields empty
+    child_links for any non-root caller).
+    """
+    path = Path.home() / ".claude" / "agent-conductor" / "spawns" / f"{session_id}.jsonl"
+    events: list[dict] = []
+    if not path.exists():
+        return events
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return events
+    events.sort(key=lambda e: e.get("spawned_at", ""))
+    return events
+
+
+def _resolve_caller_children(
+    root_transcript_path: Path,
+    all_subagent_files: dict[str, Path],
+    ledger: list[dict],
+) -> dict[str, list[tuple[str, dict]]]:
+    """Return {caller_id: [(child_id, link_metadata), ...]} in spawn order.
+
+    Pass 1 — transcript-derived: parse each known transcript and lift any
+    toolUseResult.agentId rows from it. Authoritative for root (and any caller
+    whose transcript happens to record those rows).
+
+    Pass 2 — ledger-derived: for spawn events not covered by Pass 1, claim the
+    earliest unassigned subagent file whose ctime is ≥ event.spawned_at - 2s
+    (clock-skew tolerance). The hook fires before the child transcript is
+    created, so child ctime always follows the event in real time.
+    """
+    out: dict[str, list[tuple[str, dict]]] = {}
+    assigned: set[str] = set()
+
+    transcripts_by_caller: dict[str, Path] = {"root": root_transcript_path}
+    transcripts_by_caller.update(all_subagent_files)
+
+    for caller_id, path in transcripts_by_caller.items():
+        parsed = _parse(path)
+        for child_id, link in parsed["child_links"].items():
+            if child_id in all_subagent_files and child_id not in assigned:
+                out.setdefault(caller_id, []).append((child_id, link))
+                assigned.add(child_id)
+
+    file_ctimes: list[tuple[float, str]] = []
+    for short_id, path in all_subagent_files.items():
+        if short_id in assigned:
+            continue
+        try:
+            file_ctimes.append((path.stat().st_ctime, short_id))
+        except OSError:
+            continue
+    file_ctimes.sort()
+
+    for event in ledger:
+        caller_id = event.get("caller_id") or "root"
+        spawned_at = _parse_iso(event.get("spawned_at", ""))
+        threshold = spawned_at - 2.0
+        chosen = None
+        for ct, sid in file_ctimes:
+            if sid in assigned:
+                continue
+            if ct >= threshold:
+                chosen = sid
+                break
+        if chosen is None:
+            continue
+        link = {
+            "tool_use_id": None,
+            "subagent_type": event.get("subagent_type", "general-purpose"),
+            "description": event.get("description", ""),
+            "prompt": event.get("prompt_preview", ""),
+            "result_status": "completed",
+        }
+        out.setdefault(caller_id, []).append((chosen, link))
+        assigned.add(chosen)
+
+    return out
+
+
 def build_tree(session_id: str, root_transcript_path: Path) -> dict[str, Node]:
     """Build the full tree. Returns {agent_id_or_root: Node}."""
     nodes: dict[str, Node] = {}
     all_subagent_files = _find_subagent_transcripts(root_transcript_path)
+    ledger = _load_spawn_ledger(session_id)
+    caller_children = _resolve_caller_children(root_transcript_path, all_subagent_files, ledger)
     now = time.time()
 
     # BFS from root
@@ -241,7 +361,7 @@ def build_tree(session_id: str, root_transcript_path: Path) -> dict[str, Node]:
             depth=depth,
         )
 
-        for child_id, link in parsed["child_links"].items():
+        for child_id, link in caller_children.get(agent_id, []):
             child_path = all_subagent_files.get(child_id)
             if child_path and child_id not in nodes:
                 queue.append((

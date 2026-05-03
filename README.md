@@ -4,11 +4,15 @@ A Claude Code plugin for monitoring multi-agent flows. Auto-launches a live tree
 
 ## How It Works (v2)
 
-The plugin reads Claude Code's transcript files directly (`~/.claude/projects/...`) — they are the single source of truth for the agent tree. No state mutation, no hook race conditions, no pending entries to reconcile. The tree is rebuilt every refresh by walking the root transcript and recursively descending into each subagent's transcript.
+The plugin reads Claude Code's transcript files directly (`~/.claude/projects/...`) — they are the primary source of truth for the agent tree. The tree is rebuilt every refresh by walking the root transcript and recursively descending into each subagent's transcript.
 
-- **One hook only** — `SessionStart` writes session metadata and launches the monitor
-- **Live monitor** — Reads transcripts (with mtime caching), builds the tree, renders a scrollable curses UI
+- **Two hooks** — `SessionStart` writes session metadata and launches the monitor; a `PreToolUse(Agent|Task)` hook appends a one-line spawn record to `~/.claude/agent-conductor/spawns/<session_id>.jsonl` so the monitor can recover parent→child edges that aren't recorded in subagent transcripts
+- **Live monitor** — Reads transcripts (with mtime caching), merges the spawn ledger, builds the tree, renders a scrollable curses UI
 - **Scales** — mtime caching means stable subtrees cost nothing per refresh; hundreds of agents are fine
+
+### Why the spawn ledger
+
+When a subagent spawns its own subagent (e.g. a `general-purpose` agent calling Task), Claude Code writes the grandchild transcript flat under the root session's `subagents/` directory but does not embed a `tool_use_id` or `toolUseResult.agentId` in the parent subagent's transcript. Transcript-only parsing therefore can't link grandchildren to their actual parent. The PreToolUse hook captures `transcript_path` (the calling agent's identity) at spawn time and records it in the ledger; `tree.py` matches each ledger event to the subsequently-created subagent file by ctime ordering.
 
 ## Auto-Launch
 
@@ -57,8 +61,10 @@ python3 /Users/danjames/AgentConductor/scripts/monitor.py --session-id <id>
 
 ## Files
 
+- `hooks/hooks.json` — Claude Code hook registration (SessionStart + PreToolUse)
 - `hooks/session-start.sh` — writes session metadata, launches monitor
-- `scripts/tree.py` — transcript walker, builds the tree with mtime caching
+- `hooks/pre-agent-spawn.sh` — appends spawn events to the ledger on Agent/Task calls
+- `scripts/tree.py` — transcript walker + ledger merger, builds the tree with mtime caching
 - `scripts/monitor.py` — curses TUI
 - `commands/monitor.md` — `/monitor` slash command (prints launch instructions)
 - `cursor-agent-tree-monitor/` — temporary Cursor-side agent tree monitor and extension wrapper for Cursor JSONL transcripts
@@ -83,8 +89,9 @@ node --test test/*.test.js extension/test/*.test.cjs
 
 - `~/.claude/agent-conductor/sessions/<session_id>.json` — session metadata (one write per session)
 - `~/.claude/agent-conductor/sessions/<session_id>.pid` — monitor PID (cleaned up on quit)
+- `~/.claude/agent-conductor/spawns/<session_id>.jsonl` — append-only ledger of every Agent/Task spawn keyed by the calling agent's transcript_path
 
-No agent state is stored — it's all derived from transcripts.
+The tree is derived from transcripts plus the spawn ledger; the monitor itself never mutates state.
 
 ## Requirements
 
