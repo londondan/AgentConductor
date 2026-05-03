@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 """
-monitor.py — Mode 2: Live terminal monitor for running agent flows.
+monitor.py — Live curses TUI for the agent tree.
 
-Auto-discovers the most recently active Agent Conductor state file and
-displays a live-updating tree of agents and their context window usage.
+Reads transcripts directly each refresh (via tree.build_tree), so it correctly
+shows arbitrary nesting depth and large agent counts. Uses curses.newpad for
+scrolling so hundreds of agents render efficiently.
 
 Usage:
-    python3 monitor.py [--session-id <id>]
+    python3 monitor.py [--session-id <id>] [--refresh <seconds>]
 
-Run this in a separate terminal window while Claude Code is active.
-Press Ctrl+C or q to exit.
+Keys:
+    ↑↓        scroll cursor
+    PgUp/PgDn page scroll
+    g/G       top / bottom
+    s         cycle sort: tree / tokens / recency
+    /         filter by type or description
+    d         toggle detail panel for selected agent
+    r         force refresh now
+    q / Esc   quit
 """
 
 import argparse
+import atexit
 import curses
 import json
 import os
@@ -21,292 +30,457 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
-from conductor import STATE_DIR, MODEL_MAX_TOKENS, calc_context_pct, get_peak_input_tokens
+from tree import build_tree, calc_pct, MODEL_MAX_TOKENS, Node
 
-REFRESH_INTERVAL = 2  # seconds
-WARN_THRESHOLD = 70
+SESSIONS_DIR = Path.home() / ".claude" / "agent-conductor" / "sessions"
+WARN_PCT = 70
+DEFAULT_REFRESH = 2.0
 
 
 # ---------------------------------------------------------------------------
-# State loading + live token reading
+# Session selection
 # ---------------------------------------------------------------------------
 
-def find_latest_state_file() -> Optional[Path]:
-    """Find the most recently modified state file in STATE_DIR."""
-    if not STATE_DIR.exists():
-        return None
-    candidates = list(STATE_DIR.glob("*.json"))
-    if not candidates:
-        return None
-    # Exclude .tmp files
-    candidates = [f for f in candidates if not f.suffix == ".tmp"]
-    return max(candidates, key=lambda f: f.stat().st_mtime)
-
-
-def load_state_file(path: Path) -> Optional[dict]:
-    try:
-        return json.loads(path.read_text())
-    except Exception:
-        return None
-
-
-def get_current_tokens_live(transcript_path: Optional[str]) -> int:
-    """
-    Read the last 50 lines of a running transcript to get the most recent
-    input token count. Avoids re-reading the whole file.
-    """
-    if not transcript_path or not Path(transcript_path).exists():
-        return 0
-
-    try:
-        with open(transcript_path, "rb") as f:
-            # Seek to end, read last ~8KB for recent lines
-            f.seek(0, 2)
-            size = f.tell()
-            chunk = min(size, 16384)
-            f.seek(-chunk, 2)
-            tail = f.read().decode("utf-8", errors="replace")
-    except Exception:
-        return 0
-
-    lines = [l.strip() for l in tail.splitlines() if l.strip()]
-    lines = lines[-50:]  # last 50 lines
-
-    best_input = 0
-    for line in reversed(lines):
+def list_sessions() -> list[dict]:
+    """Return session metadata dicts sorted by started_at desc."""
+    if not SESSIONS_DIR.exists():
+        return []
+    out = []
+    for f in SESSIONS_DIR.glob("*.json"):
         try:
-            entry = json.loads(line)
+            data = json.loads(f.read_text())
+            data["_meta_path"] = f
+            out.append(data)
         except Exception:
             continue
-        if entry.get("type") != "assistant":
-            continue
-        usage = (entry.get("message") or {}).get("usage")
-        if not usage:
-            continue
-        total = (
-            (usage.get("input_tokens") or 0)
-            + (usage.get("cache_creation_input_tokens") or 0)
-            + (usage.get("cache_read_input_tokens") or 0)
-        )
-        if total > best_input:
-            best_input = total
-        break  # got the most recent, stop
+    return sorted(out, key=lambda d: d.get("started_at", ""), reverse=True)
 
-    return best_input
+
+def pick_session() -> Optional[dict]:
+    sessions = list_sessions()
+    if not sessions:
+        print(f"\nNo sessions found in {SESSIONS_DIR}")
+        print("Start a Claude Code session first to populate it.\n")
+        return None
+
+    print("\n  Agent Conductor — Sessions\n")
+    for i, s in enumerate(sessions):
+        sid = s.get("session_id", "")[:8]
+        proj = Path(s.get("cwd", "")).name or "?"
+        started = (s.get("started_at") or "")[:16].replace("T", " ")
+        print(f"  [{i+1}]  {sid}   {proj:<28}  {started}")
+    print()
+
+    try:
+        raw = input("  Select (number, Enter=latest, q=quit): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if raw == "q":
+        return None
+    if raw == "":
+        return sessions[0]
+    try:
+        idx = int(raw) - 1
+        if 0 <= idx < len(sessions):
+            return sessions[idx]
+    except ValueError:
+        pass
+    print("  Invalid selection.")
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
-def _elapsed(started_at: Optional[str]) -> str:
-    if not started_at:
-        return ""
-    try:
-        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-        delta = datetime.now(timezone.utc) - start
-        s = int(delta.total_seconds())
-        m, sec = divmod(s, 60)
-        h, m = divmod(m, 60)
-        if h:
-            return f"{h}h{m:02d}m"
-        return f"{m:02d}m{sec:02d}s"
-    except Exception:
-        return ""
+SORT_MODES = ["tree", "tokens", "recency"]
 
 
-def _bar(pct: float, width: int = 20) -> str:
-    filled = round(pct / 100 * width)
-    filled = max(0, min(filled, width))
-    return "█" * filled + "░" * (width - filled)
+def _short_model(model: str) -> str:
+    m = model.replace("claude-", "")
+    return re.sub(r"-\d{6,}$", "", m)
 
 
-def _render_lines(state: dict, live_tokens: dict[str, int]) -> list[tuple[str, int]]:
+def _bar(pct: float, width: int = 12) -> str:
+    filled = max(0, min(round(pct / 100 * width), width))
+    return "▓" * filled + "░" * (width - filled)
+
+
+def _elapsed(seconds: float) -> str:
+    s = max(0, int(seconds))
+    m, sec = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m:02d}m{sec:02d}s"
+
+
+def _flatten_tree(nodes: dict[str, Node], sort_mode: str) -> list[Node]:
+    """Return nodes in display order according to sort_mode.
+    'tree': depth-first preorder from root.
+    'tokens': descending peak tokens (flat).
+    'recency': descending last_activity_at (flat).
     """
-    Build list of (text, attr) tuples for curses display.
-    attr: 0=normal, 1=bold, 2=warn(red), 3=dim, 4=green
-    """
-    lines = []
-    agents = state.get("agents", {})
-    session_id = state.get("session_id", "?")
-    cwd = state.get("cwd", "")
-    started_at = state.get("agents", {}).get("root", {}).get("started_at")
-
-    short_id = session_id[:8]
-    project = Path(cwd).name if cwd else "?"
-    elapsed = _elapsed(started_at)
-
-    lines.append((f"  Agent Conductor — Live Monitor", 1))
-    lines.append((f"  Session: {short_id}  |  Project: {project}  |  Elapsed: {elapsed}  |  Refresh: {REFRESH_INTERVAL}s", 0))
-    lines.append(("  " + "─" * 60, 3))
-    lines.append(("", 0))
-
-    def render_agent(agent_key: str, indent: int, is_last: bool, parent_prefix: str):
-        agent = agents.get(agent_key)
-        if not agent:
+    if sort_mode == "tokens":
+        return sorted(nodes.values(), key=lambda n: -n.peak_input_tokens)
+    if sort_mode == "recency":
+        return sorted(nodes.values(), key=lambda n: -n.last_activity_at)
+    # tree-order DFS
+    out: list[Node] = []
+    def walk(node_id: str):
+        n = nodes.get(node_id)
+        if not n:
             return
+        out.append(n)
+        for c in n.children:
+            walk(c)
+    walk("root")
+    # Append any orphans (shouldn't happen but safe)
+    seen = {n.agent_id for n in out}
+    for n in nodes.values():
+        if n.agent_id not in seen:
+            out.append(n)
+    return out
 
-        connector = "└── " if is_last else "├── "
-        child_prefix = parent_prefix + ("    " if is_last else "│   ")
 
-        peak = live_tokens.get(agent_key, agent.get("peak_input_tokens", 0))
-        pct = calc_context_pct(peak)
-        bar = _bar(pct)
-        status = agent.get("status", "?")
-        agent_type = agent.get("agent_type") or "?"
-        description = agent.get("description") or agent.get("prompt_preview") or ""
-        if len(description) > 45:
-            description = description[:42] + "..."
+def _format_row(n: Node, max_width: int, sort_mode: str) -> tuple[str, int]:
+    """Return (line, color_attr) for a node row."""
+    pct = calc_pct(n.peak_input_tokens)
 
-        is_running = status == "running"
-        is_pending = agent.get("pending", False)
+    # Indentation only meaningful in tree mode
+    if sort_mode == "tree":
+        indent = "  " * n.depth
+        prefix = "" if n.depth == 0 else f"{indent[:-2]}└─ "
+    else:
+        prefix = ""
 
-        if agent_key == "root":
-            model = re.sub(r"-\d{6,}$", "", (agent.get("model") or "").replace("claude-", ""))
-            label = f"  Root  ({model})"
-            pct_str = f"{pct:5.1f}%"
-            warn = "  ⚠" if pct >= WARN_THRESHOLD else ""
-            lines.append((f"{label}", 1))
-            lines.append((f"       {pct_str}  [{bar}]  {status}{warn}", 2 if pct >= WARN_THRESHOLD else (4 if is_running else 0)))
-        elif is_pending:
-            label = f"  {parent_prefix}{connector}[{agent_type}]"
-            desc_str = f' "{description}"' if description else ""
-            lines.append((f"{label}{desc_str}  (starting...)", 3))
-        else:
-            label = f"  {parent_prefix}{connector}[{agent_type}]"
-            desc_str = f' "{description}"' if description else ""
-            pct_str = f"{pct:5.1f}%"
-            warn = "  ⚠" if pct >= WARN_THRESHOLD else ""
-            elapsed_str = f"  ({_elapsed(agent.get('started_at'))})" if is_running else ""
-            lines.append((f"{label}{desc_str}", 1 if is_running else 0))
-            attr = 2 if pct >= WARN_THRESHOLD else (4 if is_running else 3)
-            lines.append((f"  {child_prefix}     {pct_str}  [{bar}]  {status}{elapsed_str}{warn}", attr))
+    if n.agent_id == "root":
+        symbol = "▶" if n.status == "running" else "·"
+        label = f"{symbol} Root [{_short_model(n.model)}]"
+    else:
+        symbol = "▶" if n.status == "running" else "✓"
+        desc = n.description or ""
+        if desc:
+            desc = f' "{desc}"'
+        label = f"{prefix}{symbol} [{n.agent_type}]{desc}"
 
-        children = [c for c in (agent.get("children") or []) if c in agents]
-        for i, child_id in enumerate(children):
-            render_agent(child_id, indent + 1, i == len(children) - 1, child_prefix)
+    pct_str = f"{pct:5.1f}%"
+    bar = _bar(pct)
+    warn = " ⚠" if pct >= WARN_PCT else "  "
 
-    render_agent("root", 0, True, "")
+    # Compose, then truncate label region to fit
+    suffix = f"  {pct_str}  {bar}{warn}"
+    label_room = max(10, max_width - len(suffix) - 2)
+    if len(label) > label_room:
+        label = label[: label_room - 1] + "…"
+    line = f"{label.ljust(label_room)}{suffix}"
 
-    lines.append(("", 0))
-    running_count = sum(1 for a in agents.values() if a.get("status") == "running")
-    total = len(agents)
-    warn_count = sum(1 for a in agents.values() if calc_context_pct(a.get("peak_input_tokens", 0)) >= WARN_THRESHOLD)
-    lines.append((f"  Agents: {total} total  |  {running_count} running", 0))
-    if warn_count:
-        lines.append((f"  ⚠  {warn_count} agent(s) >{WARN_THRESHOLD}% context used", 2))
-    lines.append((f"  Context window: {MODEL_MAX_TOKENS // 1000}k tokens per agent", 3))
-    lines.append(("", 0))
-    lines.append(("  Press q or Ctrl+C to exit", 3))
+    # color attr: 0 normal, 1 bold, 2 warn (red), 3 dim, 4 green (running)
+    if pct >= WARN_PCT:
+        attr = 2
+    elif n.status == "running":
+        attr = 4
+    elif n.agent_id == "root":
+        attr = 1
+    else:
+        attr = 3
+    return line, attr
 
+
+def _format_header(session: dict, nodes: dict[str, Node], refresh: float, sort_mode: str, filter_str: str) -> list[tuple[str, int]]:
+    sid = session.get("session_id", "")[:8]
+    proj = Path(session.get("cwd", "")).name or "?"
+    started = session.get("started_at", "")
+    elapsed = ""
+    if started:
+        try:
+            t0 = datetime.fromisoformat(started.replace("Z", "+00:00"))
+            elapsed = _elapsed((datetime.now(timezone.utc) - t0).total_seconds())
+        except Exception:
+            pass
+
+    total = len(nodes)
+    running = sum(1 for n in nodes.values() if n.status == "running")
+    total_in = sum(n.peak_input_tokens for n in nodes.values())
+    total_out = sum(n.output_tokens for n in nodes.values())
+    high = sum(1 for n in nodes.values() if calc_pct(n.peak_input_tokens) >= WARN_PCT)
+
+    now = datetime.now().strftime("%H:%M:%S")
+    lines = [
+        (f"  Agent Conductor — {now}", 1),
+        (f"  Session {sid}  ·  {proj}  ·  elapsed {elapsed}  ·  refresh {refresh:g}s", 0),
+        (f"  {total} agents  ·  {running} running ▶  ·  in {_fmt_tokens(total_in)}  out {_fmt_tokens(total_out)}  ·  ⚠ {high} high context", 2 if high else 0),
+        (f"  sort: {sort_mode}" + (f"  ·  filter: {filter_str!r}" if filter_str else ""), 3),
+        ("  " + "─" * 78, 3),
+    ]
     return lines
 
 
+def _fmt_tokens(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}k"
+    return str(n)
+
+
+def _format_footer() -> list[tuple[str, int]]:
+    return [
+        ("  " + "─" * 78, 3),
+        ("  ↑↓ scroll · PgUp/PgDn page · g/G top/bot · s sort · / filter · d detail · r refresh · q quit", 3),
+    ]
+
+
 # ---------------------------------------------------------------------------
-# Main curses loop
+# Detail panel
 # ---------------------------------------------------------------------------
 
-def monitor_loop(stdscr, state_file: Path):
-    curses.use_default_colors()
-    curses.curs_set(0)
+def _detail_lines(n: Node) -> list[str]:
+    pct = calc_pct(n.peak_input_tokens)
+    return [
+        f"  AGENT {n.agent_id}",
+        f"  type:        {n.agent_type}",
+        f"  parent:      {n.parent_id or '(root)'}",
+        f"  depth:       {n.depth}",
+        f"  status:      {n.status}",
+        f"  model:       {n.model}",
+        f"  peak input:  {n.peak_input_tokens:,}  ({pct}% of {MODEL_MAX_TOKENS//1000}k)",
+        f"  last input:  {n.last_input_tokens:,}",
+        f"  output:      {n.output_tokens:,}",
+        f"  started:     {n.started_at}",
+        f"  transcript:  {n.transcript_path}",
+        "",
+        "  description:",
+        f"    {n.description or '(none)'}",
+        "",
+        "  children:    " + (", ".join(n.children[:8]) + ("…" if len(n.children) > 8 else "")) if n.children else "  children:    (none)",
+        "",
+        "  Press any key to return.",
+    ]
 
-    # Set up color pairs
+
+# ---------------------------------------------------------------------------
+# Main TUI loop
+# ---------------------------------------------------------------------------
+
+class State:
+    def __init__(self, session: dict, refresh: float):
+        self.session = session
+        self.refresh = refresh
+        self.cursor = 0          # selected row index in flat list
+        self.scroll = 0          # top of viewport in pad
+        self.sort_mode = "tree"
+        self.filter = ""
+        self.show_detail = False
+        self.last_build_at = 0.0
+        self.nodes: dict[str, Node] = {}
+        self.flat: list[Node] = []  # current display list (after sort+filter)
+
+
+def _apply_filter(flat: list[Node], filter_str: str) -> list[Node]:
+    if not filter_str:
+        return flat
+    needle = filter_str.lower()
+    return [n for n in flat if needle in (n.agent_type or "").lower() or needle in (n.description or "").lower()]
+
+
+def _rebuild(state: State):
+    transcript_path = Path(state.session["transcript_path"])
+    nodes = build_tree(state.session["session_id"], transcript_path)
+    state.nodes = nodes
+    flat = _flatten_tree(nodes, state.sort_mode)
+    flat = _apply_filter(flat, state.filter)
+    state.flat = flat
+    if state.cursor >= len(flat):
+        state.cursor = max(0, len(flat) - 1)
+    state.last_build_at = time.time()
+
+
+def _ensure_cursor_visible(state: State, viewport_rows: int):
+    if state.cursor < state.scroll:
+        state.scroll = state.cursor
+    elif state.cursor >= state.scroll + viewport_rows:
+        state.scroll = state.cursor - viewport_rows + 1
+
+
+def _setup_colors() -> bool:
     try:
         curses.start_color()
-        curses.init_pair(1, curses.COLOR_WHITE, -1)   # bold (normal)
-        curses.init_pair(2, curses.COLOR_RED, -1)      # warn
-        curses.init_pair(3, curses.COLOR_WHITE, -1)    # dim
-        curses.init_pair(4, curses.COLOR_GREEN, -1)    # running/good
-        has_color = True
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_WHITE, -1)   # bold
+        curses.init_pair(2, curses.COLOR_RED, -1)     # warn
+        curses.init_pair(3, curses.COLOR_WHITE, -1)   # dim
+        curses.init_pair(4, curses.COLOR_GREEN, -1)   # running
+        curses.init_pair(5, curses.COLOR_CYAN, -1)    # selected
+        return True
     except Exception:
-        has_color = False
+        return False
 
-    stdscr.nodelay(True)  # non-blocking getch
-    stdscr.timeout(REFRESH_INTERVAL * 1000)
+
+def _attr(color: int, has_color: bool, bold: bool = False) -> int:
+    if not has_color:
+        return curses.A_BOLD if bold else curses.A_NORMAL
+    if color == 1:
+        return curses.A_BOLD
+    if color == 2:
+        return curses.color_pair(2) | curses.A_BOLD
+    if color == 3:
+        return curses.A_DIM
+    if color == 4:
+        return curses.color_pair(4)
+    if color == 5:
+        return curses.color_pair(5) | curses.A_REVERSE
+    return curses.A_NORMAL
+
+
+def _prompt(stdscr, prompt_text: str) -> Optional[str]:
+    h, w = stdscr.getmaxyx()
+    y = h - 1
+    stdscr.move(y, 0)
+    stdscr.clrtoeol()
+    stdscr.addstr(y, 0, prompt_text, curses.A_REVERSE)
+    curses.echo()
+    curses.curs_set(1)
+    try:
+        s = stdscr.getstr(y, len(prompt_text), 80).decode("utf-8", errors="ignore")
+    except Exception:
+        s = None
+    curses.noecho()
+    curses.curs_set(0)
+    return s
+
+
+def run(stdscr, session: dict, refresh: float):
+    has_color = _setup_colors()
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(int(refresh * 1000))
+
+    state = State(session, refresh)
+    _rebuild(state)
 
     while True:
-        # Check for quit key
-        key = stdscr.getch()
-        if key in (ord('q'), ord('Q'), 27):  # q, Q, Esc
-            break
+        h, w = stdscr.getmaxyx()
+        header = _format_header(state.session, state.nodes, state.refresh, state.sort_mode, state.filter)
+        footer = _format_footer()
+        viewport_top = len(header)
+        viewport_rows = max(1, h - len(header) - len(footer))
 
-        # Load state
-        state = load_state_file(state_file)
-        if state is None:
+        # Detail panel mode
+        if state.show_detail and 0 <= state.cursor < len(state.flat):
+            n = state.flat[state.cursor]
             stdscr.clear()
-            stdscr.addstr(0, 0, "Waiting for Agent Conductor state file...")
+            for i, line in enumerate(_detail_lines(n)[: h - 1]):
+                try:
+                    stdscr.addstr(i, 0, line[: w - 1])
+                except curses.error:
+                    pass
             stdscr.refresh()
+            ch = stdscr.getch()
+            if ch != -1:
+                state.show_detail = False
             continue
 
-        # Get live token counts for running agents
-        live_tokens: Dict[str, int] = {}
-        agents = state.get("agents", {})
-        for agent_key, agent in agents.items():
-            if agent.get("status") == "running" and not agent.get("pending"):
-                transcript = agent.get("transcript_path")
-                current = get_current_tokens_live(transcript)
-                if current > 0:
-                    live_tokens[agent_key] = current
+        _ensure_cursor_visible(state, viewport_rows)
 
-        # Render
-        render_lines = _render_lines(state, live_tokens)
-
-        stdscr.clear()
-        max_y, max_x = stdscr.getmaxyx()
-
-        for row, (text, attr) in enumerate(render_lines):
-            if row >= max_y - 1:
-                break
-            # Truncate to terminal width
-            text = text[:max_x - 1]
+        stdscr.erase()
+        # Header
+        for i, (text, color) in enumerate(header):
             try:
-                if has_color and attr == 1:
-                    stdscr.addstr(row, 0, text, curses.A_BOLD)
-                elif has_color and attr == 2:
-                    stdscr.addstr(row, 0, text, curses.color_pair(2) | curses.A_BOLD)
-                elif has_color and attr == 3:
-                    stdscr.addstr(row, 0, text, curses.A_DIM)
-                elif has_color and attr == 4:
-                    stdscr.addstr(row, 0, text, curses.color_pair(4))
-                else:
-                    stdscr.addstr(row, 0, text)
+                stdscr.addstr(i, 0, text[: w - 1], _attr(color, has_color))
             except curses.error:
-                pass  # terminal too small
+                pass
+
+        # Body
+        for vy in range(viewport_rows):
+            idx = state.scroll + vy
+            if idx >= len(state.flat):
+                break
+            n = state.flat[idx]
+            line, color = _format_row(n, w - 2, state.sort_mode)
+            attr = _attr(5, has_color) if idx == state.cursor else _attr(color, has_color)
+            try:
+                stdscr.addstr(viewport_top + vy, 0, line[: w - 1], attr)
+            except curses.error:
+                pass
+
+        # Footer
+        for i, (text, color) in enumerate(footer):
+            try:
+                stdscr.addstr(h - len(footer) + i, 0, text[: w - 1], _attr(color, has_color))
+            except curses.error:
+                pass
 
         stdscr.refresh()
 
-        # Check if session terminated
-        if state.get("terminated"):
-            time.sleep(3)  # stay visible briefly after session ends
+        ch = stdscr.getch()
+
+        # Refresh tree if interval elapsed
+        if (time.time() - state.last_build_at) >= state.refresh:
+            _rebuild(state)
+
+        if ch == -1:
+            continue
+        if ch in (ord('q'), ord('Q'), 27):
             break
+        if ch in (curses.KEY_DOWN, ord('j')):
+            state.cursor = min(len(state.flat) - 1, state.cursor + 1)
+        elif ch in (curses.KEY_UP, ord('k')):
+            state.cursor = max(0, state.cursor - 1)
+        elif ch == curses.KEY_NPAGE:
+            state.cursor = min(len(state.flat) - 1, state.cursor + viewport_rows)
+        elif ch == curses.KEY_PPAGE:
+            state.cursor = max(0, state.cursor - viewport_rows)
+        elif ch == ord('g'):
+            state.cursor = 0
+        elif ch == ord('G'):
+            state.cursor = max(0, len(state.flat) - 1)
+        elif ch == ord('s'):
+            i = SORT_MODES.index(state.sort_mode)
+            state.sort_mode = SORT_MODES[(i + 1) % len(SORT_MODES)]
+            _rebuild(state)
+        elif ch == ord('/'):
+            v = _prompt(stdscr, "  filter (empty to clear): ")
+            state.filter = (v or "").strip()
+            _rebuild(state)
+        elif ch == ord('d'):
+            state.show_detail = True
+        elif ch == ord('r'):
+            _rebuild(state)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Agent Conductor: live terminal monitor")
-    parser.add_argument("--session-id", help="Specific session ID to monitor (default: latest)")
+    parser = argparse.ArgumentParser(description="Agent Conductor — live monitor")
+    parser.add_argument("--session-id")
+    parser.add_argument("--refresh", type=float, default=DEFAULT_REFRESH)
     args = parser.parse_args()
 
     if args.session_id:
-        state_file = STATE_DIR / f"{args.session_id}.json"
-        if not state_file.exists():
-            print(f"No state file found for session: {args.session_id}")
+        meta_path = SESSIONS_DIR / f"{args.session_id}.json"
+        if not meta_path.exists():
+            print(f"No session metadata at {meta_path}")
+            sys.exit(1)
+        try:
+            session = json.loads(meta_path.read_text())
+        except Exception as e:
+            print(f"Failed to read session metadata: {e}")
             sys.exit(1)
     else:
-        state_file = find_latest_state_file()
-        if not state_file:
-            print(f"No Agent Conductor state files found in {STATE_DIR}")
-            print("Start a Claude Code session first, then run this monitor.")
-            sys.exit(1)
+        session = pick_session()
+        if session is None:
+            sys.exit(0)
 
-    print(f"Monitoring: {state_file.stem[:8]}...")
-    print("Starting live monitor... (Press q to exit)")
-    time.sleep(0.5)
+    # Write PID file for cleanup
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    pid_file = SESSIONS_DIR / f"{session['session_id']}.pid"
+    pid_file.write_text(str(os.getpid()))
+    atexit.register(lambda: pid_file.unlink(missing_ok=True))
 
     try:
-        curses.wrapper(monitor_loop, state_file)
+        curses.wrapper(run, session, args.refresh)
     except KeyboardInterrupt:
         pass
 

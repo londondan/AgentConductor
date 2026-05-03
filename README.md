@@ -1,79 +1,93 @@
 # Agent Conductor
 
-A Claude Code plugin for monitoring multi-agent flows. Tracks all subagents spawned during a session, their nesting depth, and what percentage of the context window each used — helping you identify where context rot may be degrading output quality.
+A Claude Code plugin for monitoring multi-agent flows. Auto-launches a live tree view in a separate terminal window when a session starts, so you can watch agents spawn and context usage grow in real time — including subagents that spawn their own subagents, at any depth.
 
-## Features
+## How It Works (v2)
 
-- **Auto report** — At the end of every query, prints a tree of all agents and their peak context usage
-- **Live monitor** — Run in a second terminal to watch agents spawn and context grow in real time
-- **Rot warnings** — Agents that used >70% of the context window are flagged with ⚠
+The plugin reads Claude Code's transcript files directly (`~/.claude/projects/...`) — they are the single source of truth for the agent tree. No state mutation, no hook race conditions, no pending entries to reconcile. The tree is rebuilt every refresh by walking the root transcript and recursively descending into each subagent's transcript.
 
-## Example Report Output
+- **One hook only** — `SessionStart` writes session metadata and launches the monitor
+- **Live monitor** — Reads transcripts (with mtime caching), builds the tree, renders a scrollable curses UI
+- **Scales** — mtime caching means stable subtrees cost nothing per refresh; hundreds of agents are fine
 
-```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Agent Conductor  |  session 1d541bcd  |  my-project
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Root  (sonnet-4-6)
-├── [Explore] "Explore project directory structure"
-│        46.0%  █████████░░░░░░░░░░░  completed
-│   └── [general-purpose] "Deep search sub-task"
-│            78.3%  ████████████████░░░░  completed  ⚠
-└── [Plan] "Design implementation approach"
-         22.1%  ████░░░░░░░░░░░░░░░░  completed
+## Auto-Launch
 
-  Total agents: 4  |  Context window: 200k tokens
-  ⚠  1 agent(s) used >70% context (potential rot risk)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-```
+When you start a Claude Code session, a new Terminal window opens automatically with the live monitor for that session. It runs in parallel and doesn't steal focus.
 
-## Live Monitor
-
-Open a second terminal window and run:
+## Manual Launch
 
 ```bash
-python3 ~/.claude/plugins/agent-conductor/scripts/monitor.py
+python3 /Users/danjames/AgentConductor/scripts/monitor.py
 ```
 
-The monitor auto-discovers the most recently active session. It updates every 2 seconds showing:
-- All spawned agents with their current context usage
-- Running agents highlighted in green
-- Warning in red for agents approaching context limits
+You'll see a numbered list of recent sessions. Pick one or press Enter for the latest. To skip the picker:
 
-Press `q` or `Ctrl+C` to exit.
-
-To monitor a specific session:
 ```bash
-python3 ~/.claude/plugins/agent-conductor/scripts/monitor.py --session-id <SESSION_ID>
+python3 /Users/danjames/AgentConductor/scripts/monitor.py --session-id <id>
 ```
 
-## Manual Report
+## Keys
 
-You can also trigger the report manually at any point during a session using:
+| Key | Action |
+|-----|--------|
+| `↑` `↓` / `j` `k` | Move cursor |
+| `PgUp` `PgDn` | Page scroll |
+| `g` / `G` | Top / bottom |
+| `s` | Cycle sort: tree / tokens / recency |
+| `/` | Filter by type or description |
+| `d` | Detail panel for selected agent |
+| `r` | Force refresh |
+| `q` / `Esc` | Quit |
+
+## Layout
+
 ```
-/agent-report
+┌─ Agent Conductor — 14:32:07 ─────────────────────────────────────┐
+│ Session 117990af  ·  product  ·  elapsed 1h23m  ·  refresh 2s   │
+│ 47 agents · 3 running ▶ · in 2.4M out 180k · ⚠ 5 high context   │
+│ sort: tree                                                       │
+├──────────────────────────────────────────────────────────────────┤
+│ ▶ Root [opus-4.7]                                  92.3%  ▓▓▓▓▓░ │
+│ └─ ▶ [Plan] "Design auth system"                   45.2%  ▓▓░░░░ │
+│   └─ ✓ [Explore] "Search auth patterns"            12.1%  ▓░░░░░ │
+│ └─ ✓ [Explore] "Find existing tests"               23.5%  ▓░░░░░ │
+│   └─ ✓ [code-reviewer] "Review draft"              45.7%  ▓▓░░░░ │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-## How It Works
+## Files
 
-- **SessionStart hook** — Initialises a state file at `~/.claude/agent-conductor/<session-id>.json`
-- **PreToolUse hook (Agent)** — Captures pending subagent info for the live monitor
-- **SubagentStop hook** — Reads each completed subagent's transcript for peak token usage
-- **Stop hook** — Builds the full agent tree and prints the report
+- `hooks/session-start.sh` — writes session metadata, launches monitor
+- `scripts/tree.py` — transcript walker, builds the tree with mtime caching
+- `scripts/monitor.py` — curses TUI
+- `commands/monitor.md` — `/monitor` slash command (prints launch instructions)
+- `cursor-agent-tree-monitor/` — temporary Cursor-side agent tree monitor and extension wrapper for Cursor JSONL transcripts
 
-Context window % is calculated as:
+## Cursor Agent Tree Monitor
+
+The Cursor monitor lives in `cursor-agent-tree-monitor/` while we decide how to collapse the Cursor and Agent Conductor surfaces together. It includes:
+
+- a portable agent graph core and ASCII renderer
+- a Cursor transcript adapter with recursive subagent discovery
+- a Cursor/VS Code webview extension wrapper
+- tests for live transcript parsing, context-risk rendering, session picking, and colored webview rows
+
+Run its test suite directly from the subproject:
+
+```bash
+cd cursor-agent-tree-monitor
+node --test test/*.test.js extension/test/*.test.cjs
 ```
-peak_input_tokens / 200,000 * 100
-```
 
-Where `peak_input_tokens` is the highest total input token count seen at any single API call during that agent's lifetime (including cache tokens).
+## Storage
 
-## State Files
+- `~/.claude/agent-conductor/sessions/<session_id>.json` — session metadata (one write per session)
+- `~/.claude/agent-conductor/sessions/<session_id>.pid` — monitor PID (cleaned up on quit)
 
-State files are written to `~/.claude/agent-conductor/` and persist until the next time you run a session. Old files are not automatically cleaned up — you can safely delete them manually.
+No agent state is stored — it's all derived from transcripts.
 
 ## Requirements
 
+- macOS (uses Terminal.app via `osascript` for auto-launch; manual launch works anywhere)
 - Python 3.9+
-- `jq` (for hook shell scripts)
-- `curses` (included in Python standard library)
+- `jq` (for the hook script)
