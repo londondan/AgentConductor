@@ -30,6 +30,13 @@ The core schema is environment-agnostic. Cursor-specific transcript paths, SDK r
 
 Cursor transcript nodes may include `metadata.tools`, an array of paired tool-use/tool-result records extracted from subagent JSONL files. Transcript-derived model names are recorded-only: the adapter displays explicit fields such as `model`, `modelName`, `model_name`, a subagent tool input `model`, or Cursor hook telemetry for the same conversation/tool-use ID. Otherwise, the model remains unknown.
 
+### Cursor adapter node metadata fields
+
+- `metadata.modelSource`: provenance for the displayed model name. One of `cursor_transcript`, `cursor_hook_telemetry` (direct conversation/tool-use match), `cursor_hook_order` (heuristic ordinal match by completion time), or `unknown`.
+- `metadata.modelHistory`: ordered `[{ model, recordedAt, event }]` list of every hook event observed for the node. Empty when no telemetry is available.
+- `metadata.modelSwapped`: `true` when `metadata.modelHistory` contains more than one distinct model name, indicating Cursor changed the model on the agent mid-flight.
+- `metadata.subagentId`: Cursor's tool-use ID (`subagent_id`) for the matched hook event. `null` for the root and for subagents without a matched event.
+
 ## AgentEdge
 
 - `parentId`: Parent node ID.

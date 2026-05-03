@@ -42,14 +42,29 @@ The hook records compact model events to:
 ~/.cursor/agent-tree-monitor/model-events.jsonl
 ```
 
-The extension reads that file by default. Override with `agentTreeMonitor.modelTelemetryPath` or `AGENT_TREE_MODEL_EVENTS` if needed.
+The CLI and extension read that file by default. Override with `agentTreeMonitor.modelTelemetryPath`, the `AGENT_TREE_MODEL_EVENTS` environment variable, or the CLI flags `--model-telemetry <path>` / `--no-model-telemetry`.
 
-Supported joins:
+### Subagent attribution joins (in priority order)
 
-- Root/session model: `sessionStart.conversation_id` or `session_id` matches the transcript session ID.
-- Subagent model: `subagentStop.subagent_id` matches the parent transcript `tool_use.id` when Cursor records it.
+1. **`modelForConversation`** — direct match by Cursor `conversation_id` / `session_id`. Used for the root orchestrator.
+2. **`modelForSubagentToolUse`** — direct match by `parent_conversation_id` + `subagent_id` (the Cursor tool-use ID). Provided for compatibility, but Cursor does not currently record that ID in transcript JSONL, so this lookup is rarely satisfied.
+3. **Ordinal matching by completion time** — the adapter groups all `subagentStop` events by `parent_conversation_id`, sorts by `recordedAt`, sorts the parent's child transcripts by completion mtime, and assigns the Nth event to the Nth child. Provenance is tagged `cursor_hook_order` so consumers can downgrade trust.
 
-If Cursor does not provide a subagent tool-use ID in both places, that subagent remains `unknown` rather than guessing.
+If none of the above resolve a model, the subagent's model remains `unknown` rather than guessing.
+
+### Diagnose hook payloads
+
+Cursor's hook payload schema is not formally documented. To capture the raw event JSON for inspection, set `AGENT_TREE_HOOK_DEBUG=1` in the hook command. The script will append every event payload to `~/.cursor/agent-tree-monitor/raw-events.jsonl` (override with `AGENT_TREE_RAW_EVENTS=<path>`). Disable in production — the file grows unbounded.
+
+### Model swap (drift) detection
+
+When the same conversation or subagent fires multiple hook events with different `model` values, the monitor flags the node:
+
+- `node.metadata.modelSwapped: true` and `node.metadata.modelHistory` lists every recorded model in chronological order.
+- The ASCII renderer appends `! swap: <first>→<last>` to the model sub-line.
+- The extension webview applies the `node-model-swapped` row class so the line stands out in warning color.
+
+Drift is only flagged when the recorded model name actually changes — repeated identical events do not trigger a warning.
 
 ## Core Pieces
 

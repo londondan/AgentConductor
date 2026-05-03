@@ -68,8 +68,13 @@ function buildWebviewHtml({ nonce }) {
       color: var(--vscode-testing-iconQueued);
     }
     .node-muted,
-    .node-tools {
+    .node-tools,
+    .node-model {
       color: var(--vscode-descriptionForeground);
+    }
+    .node-model-swapped {
+      color: var(--vscode-testing-iconQueued);
+      font-weight: 600;
     }
   </style>
 </head>
@@ -220,6 +225,10 @@ function buildSnapshotRowClasses(graph) {
 function appendNodeRowClasses(node, rowClasses) {
   const nodeClass = nodeRowClass(node);
   rowClasses.push(nodeClass);
+  if (node.model?.name) {
+    const modelClass = node.metadata?.modelSwapped ? "node-model-swapped" : "node-model";
+    rowClasses.push(`${nodeClass} ${modelClass}`);
+  }
   if (node.metrics?.toolCount) rowClasses.push(`${nodeClass} node-tools`);
 
   for (const child of node.children ?? []) {

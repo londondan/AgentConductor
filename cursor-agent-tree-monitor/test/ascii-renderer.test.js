@@ -54,10 +54,53 @@ test("renders a live monitor snapshot with aligned tree rows", () => {
 
   assert.match(output, /Session 117990af · cursor · product · elapsed 1h23m · refresh 2s/);
   assert.match(output, /3 agents · 2 running ▶ · in 2\.4M out 170k · ! 1 high context/);
-  assert.match(output, /│ ▶ Root \[opus-4\.7\]\s+92\.3%/);
-  assert.match(output, /│ └─ ▶ \[Plan\] \[sonnet-4\.5\] "Design auth system"\s+45\.2%/);
+  assert.match(output, /│ ▶ Root\s+92\.3%/);
+  assert.match(output, /│ model opus-4\.7/);
+  assert.match(output, /│ └─ ▶ \[Plan\] "Design auth system"\s+45\.2%/);
+  assert.match(output, /│   model sonnet-4\.5/);
   assert.match(output, /│   └─ ✓ \[Explore\] "Search auth patterns"\s+12\.1%/);
   assert.match(output, /tools 8 · err 1/);
+});
+
+test("renders model source provenance and swap warning on the model sub-line", () => {
+  const graph = normalizeSessionGraph({
+    session: { id: "drift-session", environment: "cursor", refreshSeconds: 2 },
+    nodes: [
+      {
+        id: "root",
+        type: "Root",
+        summary: "Drift demo",
+        status: "running",
+        model: { name: "claude-opus-4.7", confidence: "recorded" },
+        context: { usedTokens: 100, limitTokens: 1_000, confidence: "estimated" },
+        source: { adapter: "cursor_transcript", confidence: "estimated" },
+        metadata: { modelSource: "cursor_hook_telemetry" },
+      },
+      {
+        id: "drifted",
+        parentId: "root",
+        type: "explore",
+        summary: "Drifted child",
+        status: "completed",
+        model: { name: "claude-opus-4.7", confidence: "recorded" },
+        context: { usedTokens: 50, limitTokens: 1_000, confidence: "estimated" },
+        source: { adapter: "cursor_transcript", confidence: "estimated" },
+        metadata: {
+          modelSource: "cursor_hook_order",
+          modelSwapped: true,
+          modelHistory: [
+            { model: "claude-sonnet-4.6", recordedAt: "2026-05-03T14:40:00Z", event: "subagentStop" },
+            { model: "claude-opus-4.7", recordedAt: "2026-05-03T14:42:00Z", event: "subagentStop" },
+          ],
+        },
+      },
+    ],
+  });
+
+  const output = renderAsciiTree(graph, { width: 80, unicode: true });
+
+  assert.match(output, /model claude-opus-4\.7 \(hook\)/);
+  assert.match(output, /model claude-opus-4\.7 \(hook ord\) ! swap: claude-sonnet-4\.6→claude-opus-4\.7/);
 });
 
 test("can render with ASCII-safe status and connector fallbacks", () => {

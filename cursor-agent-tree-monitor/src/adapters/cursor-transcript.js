@@ -52,7 +52,12 @@ export class CursorTranscriptAdapter extends AgentSourceAdapter {
     const rootStats = await stat(rootPath);
     const rootLines = await this.cache.readJsonl(rootPath);
     const modelTelemetry = await readCursorHookTelemetry(this.modelTelemetryPath);
-    const rootModel = modelTelemetry.modelForConversation(sessionId) ?? extractRecordedModel(rootLines);
+    const rootHookModel = modelTelemetry.modelForConversation(sessionId);
+    const rootModel = rootHookModel ?? extractRecordedModel(rootLines);
+    const rootHistory = typeof modelTelemetry.modelHistoryForConversation === "function"
+      ? modelTelemetry.modelHistoryForConversation(sessionId)
+      : [];
+    const rootDistinctModels = new Set(rootHistory.map((entry) => entry.model).filter(Boolean));
 
     const rootSummary = extractUserQuery(rootLines) ?? "Root orchestrator";
     const nodes = [
@@ -70,7 +75,9 @@ export class CursorTranscriptAdapter extends AgentSourceAdapter {
         activityWindowMs: this.activityWindowMs,
         staleWindowMs: this.staleWindowMs,
         model: rootModel,
-        modelSource: rootModel === modelTelemetry.modelForConversation(sessionId) ? "cursor_hook_telemetry" : "cursor_transcript",
+        modelSource: rootHookModel ? "cursor_hook_telemetry" : "cursor_transcript",
+        modelHistory: rootHistory,
+        modelSwapped: rootDistinctModels.size > 1,
       }),
     ];
     const seen = new Set([sessionId]);
@@ -95,6 +102,7 @@ export class CursorTranscriptAdapter extends AgentSourceAdapter {
     const childEntries = await loadChildEntries(this.transcriptRoot, ownerSessionId, this.cache);
     const { links: taskLinks, taskCount } = extractTaskLinks(ownerLines, childEntries);
     const relevantChildEntries = taskCount > 0 ? childEntries.filter((child) => taskLinks.has(child.id)) : childEntries;
+    const ordinalMatches = matchChildrenToHookEvents(relevantChildEntries, modelTelemetry, rootSessionId);
     const nodes = [];
 
     for (const child of relevantChildEntries) {
@@ -103,8 +111,20 @@ export class CursorTranscriptAdapter extends AgentSourceAdapter {
       seen.add(childId);
 
       const task = taskLinks.get(childId);
-      const telemetryModel = task?.toolUseId ? modelTelemetry.modelForSubagentToolUse(rootSessionId, task.toolUseId) : null;
-      const model = telemetryModel ?? extractRecordedModel(child.lines, task);
+      const toolUseModel = task?.toolUseId ? modelTelemetry.modelForSubagentToolUse(rootSessionId, task.toolUseId) : null;
+      const ordinalEvent = ordinalMatches.get(childId);
+      const ordinalModel = ordinalEvent?.model ?? null;
+      const model = toolUseModel ?? ordinalModel ?? extractRecordedModel(child.lines, task);
+
+      let modelSource = "cursor_transcript";
+      if (toolUseModel) modelSource = "cursor_hook_telemetry";
+      else if (ordinalModel) modelSource = "cursor_hook_order";
+
+      const subagentHistory = ordinalEvent?.subagentId
+        ? modelTelemetry.modelHistoryForSubagent?.(rootSessionId, ordinalEvent.subagentId) ?? []
+        : [];
+      const distinctModels = new Set(subagentHistory.map((entry) => entry.model).filter(Boolean));
+      const modelSwapped = distinctModels.size > 1;
 
       nodes.push(
         transcriptNode({
@@ -122,7 +142,10 @@ export class CursorTranscriptAdapter extends AgentSourceAdapter {
           staleWindowMs: this.staleWindowMs,
           task,
           model,
-          modelSource: telemetryModel ? "cursor_hook_telemetry" : "cursor_transcript",
+          modelSource,
+          modelHistory: subagentHistory,
+          modelSwapped,
+          subagentId: ordinalEvent?.subagentId ?? null,
         }),
       );
 
@@ -133,7 +156,75 @@ export class CursorTranscriptAdapter extends AgentSourceAdapter {
   }
 }
 
-function transcriptNode({ id, parentId, type, summary, transcriptPath, modifiedAt, lines, lineCount, contextLimit, now, activityWindowMs, staleWindowMs, task, model = null, modelSource = "cursor_transcript" }) {
+// Cursor's `subagentStop` hook does not include a child transcript path or any
+// other identifier that maps directly to a subagent transcript file. The parent
+// transcript JSONL also omits `tool_use_id` for `Task` calls. The most reliable
+// signal we have is COMPLETION TIME: each hook event's `recordedAt` precedes
+// the matching child transcript's last-modified time by ~1-2 seconds.
+//
+// This function performs greedy ordinal matching:
+//   1. Collect all hook events for the parent (sorted by recordedAt ascending).
+//   2. Sort children by completion mtime (ascending).
+//   3. For each child in completion order, claim the earliest unconsumed event
+//      whose recordedAt is at or before the child's mtime.
+//
+// Edge cases:
+//   - A child whose hook event has not yet been written (still running) gets no
+//     match and falls back to transcript-extracted model (or `unknown`).
+//   - Extra hook events (no matching child file yet) remain unmatched.
+//   - In nested subagent trees, this assumes hook events scope to the immediate
+//     parent. If Cursor keys all events to the root session, deeper levels may
+//     receive incorrect ordinal assignments and should fall back to the
+//     transcript model. Provenance is tagged `cursor_hook_order` so consumers
+//     can downgrade trust accordingly.
+function matchChildrenToHookEvents(childEntries, modelTelemetry, parentLookupId) {
+  const matches = new Map();
+  if (typeof modelTelemetry.subagentEventsForParent !== "function") return matches;
+
+  const events = modelTelemetry.subagentEventsForParent(parentLookupId);
+  if (events.length === 0) return matches;
+
+  const sortedChildren = [...childEntries].sort((a, b) => a.stats.mtimeMs - b.stats.mtimeMs);
+  const consumed = new Array(events.length).fill(false);
+
+  for (const child of sortedChildren) {
+    const childMs = child.stats.mtimeMs;
+    let claimedIndex = -1;
+    for (let i = 0; i < events.length; i += 1) {
+      if (consumed[i]) continue;
+      if (events[i].recordedAtMs > childMs) break;
+      claimedIndex = i;
+      break;
+    }
+    if (claimedIndex >= 0) {
+      consumed[claimedIndex] = true;
+      matches.set(child.id, events[claimedIndex]);
+    }
+  }
+
+  return matches;
+}
+
+function transcriptNode({
+  id,
+  parentId,
+  type,
+  summary,
+  transcriptPath,
+  modifiedAt,
+  lines,
+  lineCount,
+  contextLimit,
+  now,
+  activityWindowMs,
+  staleWindowMs,
+  task,
+  model = null,
+  modelSource = "cursor_transcript",
+  modelHistory = [],
+  modelSwapped = false,
+  subagentId = null,
+}) {
   const estimatedTokens = Math.max(1, lineCount) * 1_000;
   const state = inferAgentStatus({ now, modifiedAt, lines, activityWindowMs, staleWindowMs });
   const tools = extractToolAttribution(lines);
@@ -157,8 +248,26 @@ function transcriptNode({ id, parentId, type, summary, transcriptPath, modifiedA
       { kind: "file", value: transcriptPath },
       ...(task ? [{ kind: "task", value: task.prompt }] : []),
     ],
-    metadata: { transcriptPath, lineCount, modifiedAt: modifiedAt.toISOString(), statusHeuristic: state.reason, tools: tools.tools, modelSource: recordedModel ? modelSource : "unknown" },
+    metadata: {
+      transcriptPath,
+      lineCount,
+      modifiedAt: modifiedAt.toISOString(),
+      statusHeuristic: state.reason,
+      tools: tools.tools,
+      modelSource: recordedModel ? modelSource : "unknown",
+      modelHistory,
+      modelSwapped: modelSwapped && distinctModelCount(modelHistory) > 1,
+      subagentId,
+    },
   };
+}
+
+function distinctModelCount(history) {
+  const distinct = new Set();
+  for (const entry of history ?? []) {
+    if (entry?.model) distinct.add(entry.model);
+  }
+  return distinct.size;
 }
 
 function extractRecordedModel(lines, task) {

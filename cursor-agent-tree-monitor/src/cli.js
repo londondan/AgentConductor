@@ -1,8 +1,13 @@
 #!/usr/bin/env node
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 import { CursorTranscriptAdapter } from "./adapters/cursor-transcript.js";
 import { normalizeSessionGraph } from "./core.js";
 import { renderAsciiTree } from "./ascii-renderer.js";
 import { createLiveMonitor } from "./live-monitor.js";
+
+const DEFAULT_MODEL_TELEMETRY_PATH = join(homedir(), ".cursor", "agent-tree-monitor", "model-events.jsonl");
 
 export function parseCliArgs(args) {
   const options = {
@@ -12,6 +17,7 @@ export function parseCliArgs(args) {
     refreshSeconds: 2,
     unicode: true,
     once: false,
+    modelTelemetryPath: process.env.AGENT_TREE_MODEL_EVENTS || DEFAULT_MODEL_TELEMETRY_PATH,
   };
 
   for (let index = 0; index < args.length; index += 1) {
@@ -22,6 +28,8 @@ export function parseCliArgs(args) {
     else if (arg === "--refresh") options.refreshSeconds = Number(args[++index]);
     else if (arg === "--ascii") options.unicode = false;
     else if (arg === "--once") options.once = true;
+    else if (arg === "--model-telemetry") options.modelTelemetryPath = args[++index];
+    else if (arg === "--no-model-telemetry") options.modelTelemetryPath = null;
     else if (arg === "--help") options.help = true;
     else throw new Error(`Unknown option: ${arg}`);
   }
@@ -59,7 +67,10 @@ export async function runCli(args = process.argv.slice(2), io = process) {
 
 function createAdapter(options) {
   if (options.adapter === "cursor-transcript") {
-    return new CursorTranscriptAdapter({ transcriptRoot: options.root });
+    return new CursorTranscriptAdapter({
+      transcriptRoot: options.root,
+      modelTelemetryPath: options.modelTelemetryPath,
+    });
   }
 
   throw new Error(`Unsupported adapter: ${options.adapter}`);
@@ -81,6 +92,10 @@ Options:
   --refresh <seconds>           Refresh interval, defaults to 2
   --ascii                       Use ASCII-safe output
   --once                        Render one snapshot and exit
+  --model-telemetry <path>      Override the hook telemetry jsonl
+                                (defaults to AGENT_TREE_MODEL_EVENTS or
+                                ~/.cursor/agent-tree-monitor/model-events.jsonl)
+  --no-model-telemetry          Disable hook telemetry merging
 `;
 }
 

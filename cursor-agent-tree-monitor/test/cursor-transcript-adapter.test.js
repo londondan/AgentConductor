@@ -402,6 +402,148 @@ test("recursively follows child agent IDs into top-level transcript directories"
   assert.equal(byId.get(jurassicId).summary, "Lookup Jurassic Park");
 });
 
+test("attributes subagent models via ordinal matching when parent transcript lacks tool_use_id", async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), "agent-tree-monitor-"));
+  const sessionId = "ordinal-root";
+  const childA = "ordinal-child-a";
+  const childB = "ordinal-child-b";
+  const childC = "ordinal-child-c";
+  const sessionDir = join(rootDir, sessionId);
+  const telemetryPath = join(rootDir, "model-events.jsonl");
+  await mkdir(join(sessionDir, "subagents"), { recursive: true });
+
+  // Parent transcript has 3 Task tool_use entries with NO ids — mirrors what
+  // Cursor actually records.
+  await writeFile(
+    join(sessionDir, `${sessionId}.jsonl`),
+    [
+      jsonlUser("Spawn three diagnostic subagents"),
+      JSON.stringify({
+        role: "assistant",
+        message: {
+          content: [
+            { type: "tool_use", name: "Task", input: { resume: childA, description: "Diagnostic subagent A", subagent_type: "generalPurpose" } },
+            { type: "tool_use", name: "Task", input: { resume: childB, description: "Diagnostic subagent B", subagent_type: "generalPurpose" } },
+            { type: "tool_use", name: "Task", input: { resume: childC, description: "Diagnostic subagent C", subagent_type: "generalPurpose" } },
+          ],
+        },
+      }),
+    ].join("\n"),
+  );
+
+  await writeFile(join(sessionDir, "subagents", `${childA}.jsonl`), jsonlUser("alpha"));
+  await writeFile(join(sessionDir, "subagents", `${childB}.jsonl`), jsonlUser("bravo"));
+  await writeFile(join(sessionDir, "subagents", `${childC}.jsonl`), jsonlUser("charlie"));
+
+  // Children completed in deterministic mtime order: A → B → C.
+  await utimes(join(sessionDir, "subagents", `${childA}.jsonl`), new Date("2026-05-03T14:40:40.000Z"), new Date("2026-05-03T14:40:40.000Z"));
+  await utimes(join(sessionDir, "subagents", `${childB}.jsonl`), new Date("2026-05-03T14:40:40.870Z"), new Date("2026-05-03T14:40:40.870Z"));
+  await utimes(join(sessionDir, "subagents", `${childC}.jsonl`), new Date("2026-05-03T14:40:41.070Z"), new Date("2026-05-03T14:40:41.070Z"));
+
+  // Hook events fire 1-2 seconds before each child's mtime.
+  await writeFile(
+    telemetryPath,
+    [
+      JSON.stringify({ event: "subagentStop", recordedAt: "2026-05-03T14:40:38.050Z", parentConversationId: sessionId, subagentId: "toolu_1", model: "model-for-A" }),
+      JSON.stringify({ event: "subagentStop", recordedAt: "2026-05-03T14:40:39.141Z", parentConversationId: sessionId, subagentId: "toolu_2", model: "model-for-B" }),
+      JSON.stringify({ event: "subagentStop", recordedAt: "2026-05-03T14:40:39.707Z", parentConversationId: sessionId, subagentId: "toolu_3", model: "model-for-C" }),
+    ].join("\n"),
+  );
+
+  const adapter = new CursorTranscriptAdapter({ transcriptRoot: rootDir, modelTelemetryPath: telemetryPath });
+  const graph = await adapter.loadSessionGraph(sessionId);
+  const byId = new Map(graph.nodes.map((node) => [node.id, node]));
+
+  assert.equal(byId.get(childA).model.name, "model-for-A");
+  assert.equal(byId.get(childA).metadata.modelSource, "cursor_hook_order");
+  assert.equal(byId.get(childA).metadata.subagentId, "toolu_1");
+  assert.equal(byId.get(childB).model.name, "model-for-B");
+  assert.equal(byId.get(childB).metadata.subagentId, "toolu_2");
+  assert.equal(byId.get(childC).model.name, "model-for-C");
+  assert.equal(byId.get(childC).metadata.subagentId, "toolu_3");
+});
+
+test("does not attribute hook events whose recordedAt is after the child's completion mtime", async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), "agent-tree-monitor-"));
+  const sessionId = "future-event-root";
+  const childId = "future-event-child";
+  const sessionDir = join(rootDir, sessionId);
+  const telemetryPath = join(rootDir, "model-events.jsonl");
+  await mkdir(join(sessionDir, "subagents"), { recursive: true });
+
+  await writeFile(
+    join(sessionDir, `${sessionId}.jsonl`),
+    JSON.stringify({
+      role: "assistant",
+      message: {
+        content: [
+          { type: "tool_use", name: "Task", input: { resume: childId, description: "Lonely child", subagent_type: "generalPurpose" } },
+        ],
+      },
+    }),
+  );
+  await writeFile(join(sessionDir, "subagents", `${childId}.jsonl`), jsonlUser("done early"));
+  await utimes(join(sessionDir, "subagents", `${childId}.jsonl`), new Date("2026-05-03T14:40:00.000Z"), new Date("2026-05-03T14:40:00.000Z"));
+
+  // Only event is AFTER the child's mtime (different subagent that hasn't
+  // produced a transcript yet).
+  await writeFile(
+    telemetryPath,
+    JSON.stringify({ event: "subagentStop", recordedAt: "2026-05-03T15:00:00.000Z", parentConversationId: sessionId, subagentId: "toolu_future", model: "future-model" }),
+  );
+
+  const adapter = new CursorTranscriptAdapter({ transcriptRoot: rootDir, modelTelemetryPath: telemetryPath });
+  const graph = await adapter.loadSessionGraph(sessionId);
+  const child = graph.nodes.find((node) => node.id === childId);
+
+  assert.equal(child.model.confidence, "unknown", "child should not consume an event from the future");
+  assert.equal(child.metadata.modelSource, "unknown");
+});
+
+test("flags modelSwapped on a subagent whose hook fired with multiple distinct models", async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), "agent-tree-monitor-"));
+  const sessionId = "drift-root";
+  const childId = "drift-child";
+  const sessionDir = join(rootDir, sessionId);
+  const telemetryPath = join(rootDir, "model-events.jsonl");
+  await mkdir(join(sessionDir, "subagents"), { recursive: true });
+
+  await writeFile(
+    join(sessionDir, `${sessionId}.jsonl`),
+    JSON.stringify({
+      role: "assistant",
+      message: {
+        content: [
+          { type: "tool_use", name: "Task", input: { resume: childId, description: "Drifty child", subagent_type: "generalPurpose" } },
+        ],
+      },
+    }),
+  );
+  await writeFile(join(sessionDir, "subagents", `${childId}.jsonl`), jsonlUser("done"));
+  await utimes(join(sessionDir, "subagents", `${childId}.jsonl`), new Date("2026-05-03T14:40:42.000Z"), new Date("2026-05-03T14:40:42.000Z"));
+
+  // Same subagentId fires twice with different models — Cursor swapped the
+  // model mid-flight.
+  await writeFile(
+    telemetryPath,
+    [
+      JSON.stringify({ event: "subagentStop", recordedAt: "2026-05-03T14:40:38.000Z", parentConversationId: sessionId, subagentId: "toolu_drift", model: "claude-sonnet-4.6" }),
+      JSON.stringify({ event: "subagentStop", recordedAt: "2026-05-03T14:40:40.000Z", parentConversationId: sessionId, subagentId: "toolu_drift", model: "claude-opus-4.7" }),
+    ].join("\n"),
+  );
+
+  const adapter = new CursorTranscriptAdapter({ transcriptRoot: rootDir, modelTelemetryPath: telemetryPath });
+  const graph = await adapter.loadSessionGraph(sessionId);
+  const child = graph.nodes.find((node) => node.id === childId);
+
+  assert.equal(child.metadata.modelSwapped, true);
+  assert.equal(child.metadata.modelHistory.length, 2);
+  assert.deepEqual(
+    child.metadata.modelHistory.map((entry) => entry.model),
+    ["claude-sonnet-4.6", "claude-opus-4.7"],
+  );
+});
+
 function jsonlUser(query) {
   return JSON.stringify({
     role: "user",

@@ -104,6 +104,42 @@ test("builds row classes for colored webview agent states", () => {
   ]);
 });
 
+test("emits a node-model row class for the model sub-line and warns on drift", () => {
+  const rowClasses = buildSnapshotRowClasses({
+    nodes: [
+      { id: "root", status: "running", risk: { kind: "normal" }, metrics: {}, model: { name: "claude-opus-4.7" } },
+      {
+        id: "drifted",
+        parentId: "root",
+        status: "completed",
+        risk: { kind: "normal" },
+        metrics: {},
+        model: { name: "claude-opus-4.7" },
+        metadata: { modelSwapped: true },
+      },
+    ],
+  });
+
+  assert.deepEqual(rowClasses, [
+    "snapshot-meta",
+    "snapshot-meta",
+    "snapshot-meta",
+    "snapshot-meta",
+    "node-running",
+    "node-running node-model",
+    "node-completed",
+    "node-completed node-model-swapped",
+    "snapshot-meta",
+  ]);
+});
+
+test("renders model sub-line styles in webview HTML", () => {
+  const html = buildWebviewHtml({ nonce: "abc123" });
+
+  assert.match(html, /node-model/);
+  assert.match(html, /node-model-swapped/);
+});
+
 test("builds a compact status bar summary from a normalized graph", () => {
   assert.equal(
     buildStatusSummary({

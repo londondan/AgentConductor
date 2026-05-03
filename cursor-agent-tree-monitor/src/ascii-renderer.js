@@ -28,24 +28,56 @@ function renderNode(node, prefix, isRoot, lines, innerWidth, glyphs) {
   const metric = `${percent.padStart(6)}  ${bar}`;
   const availableLabelWidth = Math.max(1, innerWidth - metric.length - 4);
   lines.push(frameLine(`${truncate(label, availableLabelWidth).padEnd(availableLabelWidth)}  ${metric}`, innerWidth, glyphs));
+
+  const childIndent = `${prefix}${isRoot ? "" : "  "}`;
+  const modelLine = formatModelLine(node);
+  if (modelLine) {
+    lines.push(frameLine(`${childIndent}${modelLine}`, innerWidth, glyphs));
+  }
   if (node.metrics?.toolCount) {
-    lines.push(frameLine(`${prefix}${isRoot ? "" : "  "}tools ${node.metrics.toolCount}${node.metrics.errorCount ? ` · err ${node.metrics.errorCount}` : ""}`, innerWidth, glyphs));
+    lines.push(frameLine(`${childIndent}tools ${node.metrics.toolCount}${node.metrics.errorCount ? ` · err ${node.metrics.errorCount}` : ""}`, innerWidth, glyphs));
   }
 
-  const childPrefix = `${prefix}${isRoot ? "" : "  "}`;
   for (const child of node.children) {
-    renderNode(child, childPrefix, false, lines, innerWidth, glyphs);
+    renderNode(child, childIndent, false, lines, innerWidth, glyphs);
   }
 }
 
 function formatNodeLabel(node, status, isRoot) {
-  const model = node.model?.name ? ` [${node.model.name}]` : "";
   if (isRoot) {
-    return `${status} ${node.type}${model}`;
+    return `${status} ${node.type}`;
   }
 
   const summary = node.summary ? ` "${node.summary}"` : "";
-  return `${status} [${node.type}]${model}${summary}`;
+  return `${status} [${node.type}]${summary}`;
+}
+
+function formatModelLine(node) {
+  const modelName = node.model?.name;
+  if (!modelName) return null;
+
+  const source = node.metadata?.modelSource;
+  const sourceTag = source && source !== "cursor_transcript" ? formatSourceTag(source) : "";
+  const swapTag = node.metadata?.modelSwapped ? formatSwapTag(node.metadata.modelHistory) : "";
+  return `model ${modelName}${sourceTag}${swapTag}`;
+}
+
+function formatSourceTag(source) {
+  if (source === "cursor_hook_telemetry") return " (hook)";
+  if (source === "cursor_hook_order") return " (hook ord)";
+  if (source === "cursor_transcript") return "";
+  if (source === "unknown") return " (?)";
+  return ` (${source})`;
+}
+
+function formatSwapTag(history) {
+  const distinct = [];
+  for (const entry of history ?? []) {
+    if (entry?.model && !distinct.includes(entry.model)) distinct.push(entry.model);
+  }
+  if (distinct.length < 2) return "";
+  const arrow = distinct.length === 2 ? `${distinct[0]}→${distinct[1]}` : `${distinct[0]}→…→${distinct[distinct.length - 1]}`;
+  return ` ! swap: ${arrow}`;
 }
 
 function headerLine(graph) {
