@@ -1,0 +1,16 @@
+{
+  "name": "agent-conductor",
+  "owner": {
+    "name": "londondan"
+  },
+  "description": "Live monitor for Claude Code multi-agent flows",
+  "plugins": [
+    {
+      "name": "agent-conductor",
+      "source": ".",
+      "description": "Auto-launches a live tree view of agent spawns and per-agent context usage in a separate terminal when a Claude Code session starts.",
+      "version": "0.1.0",
+      "homepage": "https://github.com/londondan/AgentConductor"
+    }
+  ]
+}
