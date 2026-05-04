@@ -18,10 +18,27 @@ EXTENDED_MAX_TOKENS = 1_000_000
 RUNNING_GRACE_SECONDS = 30  # transcript untouched for >30s ⇒ completed
 
 
+def _user_selected_model_variant() -> str:
+    """Return the user's selected model string from ~/.claude/settings.json
+    (e.g. 'opus[1m]', 'sonnet[1m]'), or '' if none. Claude Code records the
+    [1m] suffix here even though it strips it from transcript model fields,
+    so this is the only reliable signal that a 1M variant is active."""
+    try:
+        with open(Path.home() / ".claude" / "settings.json", "r", encoding="utf-8") as f:
+            return (json.load(f).get("model") or "").strip()
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+
+_USER_MODEL_VARIANT = _user_selected_model_variant()
+
+
 def model_max_tokens(model: str) -> int:
-    """Context window for a given model id. Models with the [1m] suffix are
-    1M-context variants (e.g. claude-opus-4-7[1m]); everything else is 200k."""
-    if model and "[1m]" in model:
+    """Context window for a given model id. Returns 1M when [1m] appears
+    either in the transcript model string or in the user's settings.json
+    `model` field — transcripts don't carry the suffix, so settings is
+    needed as a fallback signal."""
+    if "[1m]" in (model or "") or "[1m]" in _USER_MODEL_VARIANT:
         return EXTENDED_MAX_TOKENS
     return DEFAULT_MAX_TOKENS
 
