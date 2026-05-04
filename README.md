@@ -20,14 +20,16 @@ When you start a Claude Code session, a new Terminal window opens automatically 
 
 ## Manual Launch
 
+From the repo root:
+
 ```bash
-python3 /AgentConductor/scripts/monitor.py
+python3 scripts/monitor.py
 ```
 
 You'll see a numbered list of recent sessions. Pick one or press Enter for the latest. To skip the picker:
 
 ```bash
-python3 /AgentConductor/scripts/monitor.py --session-id <id>
+python3 scripts/monitor.py --session-id <id>
 ```
 
 ## Keys
