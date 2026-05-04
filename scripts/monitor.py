@@ -165,7 +165,7 @@ def _format_row(n: Node, max_width: int, sort_mode: str) -> tuple[str, int]:
         desc = n.description or ""
         if desc:
             desc = f' "{desc}"'
-        label = f"{prefix}{symbol} [{n.agent_type}]{desc}"
+        label = f"{prefix}{symbol} [{_short_model(n.model)}]{desc}"
 
     pct_str = f"{pct:5.1f}%"
     bar = _bar(pct)
