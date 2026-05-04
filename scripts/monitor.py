@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
-from tree import build_tree, calc_pct, MODEL_MAX_TOKENS, Node
+from tree import build_tree, calc_pct, model_max_tokens, Node
 
 SESSIONS_DIR = Path.home() / ".claude" / "agent-conductor" / "sessions"
 WARN_PCT = 70
@@ -148,7 +148,7 @@ def _flatten_tree(nodes: dict[str, Node], sort_mode: str) -> list[Node]:
 
 def _format_row(n: Node, max_width: int, sort_mode: str) -> tuple[str, int]:
     """Return (line, color_attr) for a node row."""
-    pct = calc_pct(n.peak_input_tokens)
+    pct = calc_pct(n.peak_input_tokens, n.model)
 
     # Indentation only meaningful in tree mode
     if sort_mode == "tree":
@@ -206,7 +206,7 @@ def _format_header(session: dict, nodes: dict[str, Node], refresh: float, sort_m
     running = sum(1 for n in nodes.values() if n.status == "running")
     total_in = sum(n.peak_input_tokens for n in nodes.values())
     total_out = sum(n.output_tokens for n in nodes.values())
-    high = sum(1 for n in nodes.values() if calc_pct(n.peak_input_tokens) >= WARN_PCT)
+    high = sum(1 for n in nodes.values() if calc_pct(n.peak_input_tokens, n.model) >= WARN_PCT)
 
     now = datetime.now().strftime("%H:%M:%S")
     lines = [
@@ -239,7 +239,9 @@ def _format_footer() -> list[tuple[str, int]]:
 # ---------------------------------------------------------------------------
 
 def _detail_lines(n: Node) -> list[str]:
-    pct = calc_pct(n.peak_input_tokens)
+    pct = calc_pct(n.peak_input_tokens, n.model)
+    limit = model_max_tokens(n.model)
+    limit_label = f"{limit // 1_000_000}M" if limit >= 1_000_000 else f"{limit // 1000}k"
     return [
         f"  AGENT {n.agent_id}",
         f"  type:        {n.agent_type}",
@@ -247,7 +249,7 @@ def _detail_lines(n: Node) -> list[str]:
         f"  depth:       {n.depth}",
         f"  status:      {n.status}",
         f"  model:       {n.model}",
-        f"  peak input:  {n.peak_input_tokens:,}  ({pct}% of {MODEL_MAX_TOKENS//1000}k)",
+        f"  peak input:  {n.peak_input_tokens:,}  ({pct}% of {limit_label})",
         f"  last input:  {n.last_input_tokens:,}",
         f"  output:      {n.output_tokens:,}",
         f"  started:     {n.started_at}",

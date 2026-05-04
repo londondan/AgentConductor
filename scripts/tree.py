@@ -13,8 +13,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-MODEL_MAX_TOKENS = 200_000
+DEFAULT_MAX_TOKENS = 200_000
+EXTENDED_MAX_TOKENS = 1_000_000
 RUNNING_GRACE_SECONDS = 30  # transcript untouched for >30s ⇒ completed
+
+
+def model_max_tokens(model: str) -> int:
+    """Context window for a given model id. Models with the [1m] suffix are
+    1M-context variants (e.g. claude-opus-4-7[1m]); everything else is 200k."""
+    if model and "[1m]" in model:
+        return EXTENDED_MAX_TOKENS
+    return DEFAULT_MAX_TOKENS
 
 
 @dataclass
@@ -377,5 +386,5 @@ def build_tree(session_id: str, root_transcript_path: Path) -> dict[str, Node]:
     return nodes
 
 
-def calc_pct(peak: int) -> float:
-    return round(100 * peak / MODEL_MAX_TOKENS, 1)
+def calc_pct(peak: int, model: str = "") -> float:
+    return round(100 * peak / model_max_tokens(model), 1)
