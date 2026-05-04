@@ -357,19 +357,15 @@ def build_tree(session_id: str, root_transcript_path: Path) -> dict[str, Node]:
         except OSError:
             mtime = 0.0
 
-        # Status: completed if parent has matching toolUseResult, OR transcript untouched > grace.
+        # Status: trust file activity first — if the child's own transcript was touched within
+        # the grace window, treat it as running regardless of what the parent has recorded.
         # For root, status is always "running" while session active (we don't know when it ends).
-        status = "running"
         if agent_id == "root":
             status = "running" if (now - mtime) < RUNNING_GRACE_SECONDS else "idle"
+        elif (now - mtime) < RUNNING_GRACE_SECONDS:
+            status = "running"
         else:
-            # Check if parent recorded a toolUseResult for this agent (which means it returned)
-            parent_node_transcript = nodes.get(parent_id).transcript_path if parent_id and parent_id in nodes else None
-            parent_parsed = _parse(parent_node_transcript) if parent_node_transcript else None
-            if parent_parsed and agent_id in parent_parsed["child_links"]:
-                status = "completed"
-            elif (now - mtime) >= RUNNING_GRACE_SECONDS:
-                status = "completed"
+            status = "completed"
 
         nodes[agent_id] = Node(
             agent_id=agent_id,
