@@ -14,6 +14,17 @@ The plugin reads Claude Code's transcript files directly (`~/.claude/projects/..
 
 When a subagent spawns its own subagent (e.g. a `general-purpose` agent calling Task), Claude Code writes the grandchild transcript flat under the root session's `subagents/` directory but does not embed a `tool_use_id` or `toolUseResult.agentId` in the parent subagent's transcript. Transcript-only parsing therefore can't link grandchildren to their actual parent. The PreToolUse hook captures `transcript_path` (the calling agent's identity) at spawn time and records it in the ledger; `tree.py` matches each ledger event to the subsequently-created subagent file by ctime ordering.
 
+## Install
+
+In Claude Code, run:
+
+```
+/plugin marketplace add londondan/AgentConductor
+/plugin install agent-conductor@agent-conductor
+```
+
+Restart Claude Code (or start a new session) so the `SessionStart` hook fires.
+
 ## Auto-Launch
 
 When you start a Claude Code session, a new Terminal window opens automatically with the live monitor for that session. It runs in parallel and doesn't steal focus.
